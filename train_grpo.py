@@ -62,6 +62,10 @@ def parse_args():
     p.add_argument("--lora_alpha", type=int, default=32)
     p.add_argument("--lora_dropout", type=float, default=0.05)
 
+    # 양자화 (T4/16GB 환경에서는 --use_4bit 권장, A100 40GB는 기본 bfloat16)
+    p.add_argument("--use_4bit", action="store_true",
+                   help="QLoRA: 4-bit 양자화로 메모리 절약 (T4 16GB 환경)")
+
     # 저장
     p.add_argument("--output_dir", default="checkpoints/grpo_run")
     p.add_argument("--save_every", type=int, default=50)
@@ -70,18 +74,36 @@ def parse_args():
     return p.parse_args()
 
 
-def load_model_and_tokenizer(model_id: str, lora_r: int, lora_alpha: int, lora_dropout: float):
-    print(f"모델 로딩: {model_id}")
+def load_model_and_tokenizer(
+    model_id: str,
+    lora_r: int,
+    lora_alpha: int,
+    lora_dropout: float,
+    use_4bit: bool = False,
+):
+    print(f"모델 로딩: {model_id}  ({'QLoRA 4-bit' if use_4bit else 'bfloat16'})")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # 학습 대상 모델 (LoRA)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-    )
+    if use_4bit:
+        from transformers import BitsAndBytesConfig
+        from peft import prepare_model_for_kbit_training
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        )
+        load_kwargs = {"quantization_config": bnb_config, "device_map": "auto"}
+    else:
+        load_kwargs = {"torch_dtype": torch.bfloat16, "device_map": "auto"}
+
+    # 학습 대상 모델 (LoRA / QLoRA)
+    model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+    if use_4bit:
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+
     lora_config = LoraConfig(
         r=lora_r,
         lora_alpha=lora_alpha,
@@ -95,11 +117,7 @@ def load_model_and_tokenizer(model_id: str, lora_r: int, lora_alpha: int, lora_d
 
     # 레퍼런스 모델 (고정, KL 패널티용)
     print("레퍼런스 모델 로딩...")
-    ref_model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-    )
+    ref_model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
     for p in ref_model.parameters():
         p.requires_grad = False
     ref_model.eval()
@@ -121,7 +139,8 @@ def main():
         json.dump(config_dict, f, indent=2)
 
     model, ref_model, tokenizer = load_model_and_tokenizer(
-        args.model_id, args.lora_r, args.lora_alpha, args.lora_dropout
+        args.model_id, args.lora_r, args.lora_alpha, args.lora_dropout,
+        use_4bit=args.use_4bit,
     )
 
     condition = Condition(args.condition)
