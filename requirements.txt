@@ -1,2 +1,11 @@
+# 기존
 openai>=1.30.0
 pandas
+python-dotenv
+
+# GRPO 학습 스택
+torch>=2.2.0
+transformers>=4.43.0
+peft>=0.11.0
+accelerate>=0.30.0
+bitsandbytes>=0.43.0
