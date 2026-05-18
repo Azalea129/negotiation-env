@@ -26,6 +26,7 @@ Usage:
 """
 
 import argparse
+import os
 import statistics
 from pathlib import Path
 from typing import Optional
@@ -119,12 +120,14 @@ def load_from_stage1(
             bnb_4bit_compute_dtype=_torch.float16,
         )
         base = AutoModelForCausalLM.from_pretrained(
-            base_model_name, quantization_config=bnb_config, device_map=device
+            base_model_name, quantization_config=bnb_config, device_map=device,
+            token=os.environ.get("HF_TOKEN"),
         )
         base = prepare_model_for_kbit_training(base)
     else:
         base = AutoModelForCausalLM.from_pretrained(
-            base_model_name, torch_dtype="auto", device_map=device
+            base_model_name, torch_dtype="auto", device_map=device,
+            token=os.environ.get("HF_TOKEN"),
         )
     base = PeftModel.from_pretrained(base, str(ckpt / "lora_adapter"))
 
@@ -275,7 +278,8 @@ def main() -> None:
     device = args.device if torch.cuda.is_available() else "cpu"
 
     # Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    hf_token = os.environ.get("HF_TOKEN")
+    tokenizer = AutoTokenizer.from_pretrained(args.model, token=hf_token)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 

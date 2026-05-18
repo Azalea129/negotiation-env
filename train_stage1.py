@@ -31,6 +31,7 @@ Usage:
 
 import argparse
 import math
+import os
 from functools import partial
 from pathlib import Path
 
@@ -157,7 +158,8 @@ def main() -> None:
     device = args.device if torch.cuda.is_available() else "cpu"
 
     # Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    hf_token = os.environ.get("HF_TOKEN")
+    tokenizer = AutoTokenizer.from_pretrained(args.model, token=hf_token)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
