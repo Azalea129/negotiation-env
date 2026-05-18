@@ -92,11 +92,13 @@ class LASHModel(nn.Module):
         attention_mask: Tensor,
     ) -> Tensor:
         """Run Llama transformer (no LM head), return last hidden states."""
+        # Cast to backbone dtype (e.g. bfloat16) — LASH modules init in float32
+        dtype = next(self._llama_model.parameters()).dtype
         out = self._llama_model(
-            inputs_embeds=inputs_embeds,
+            inputs_embeds=inputs_embeds.to(dtype),
             attention_mask=attention_mask,
         )
-        return out.last_hidden_state   # (B, seq, d)
+        return out.last_hidden_state.float()   # (B, seq, d) — back to float32 for LASH modules
 
     def _mask_pool(self, hidden: Tensor, mask: Tensor) -> Tensor:
         """Mask-aware mean pooling: (B, seq, d), (B, seq) → (B, d)."""
@@ -159,9 +161,11 @@ class LASHModel(nn.Module):
         """
         B = input_ids.size(0)
 
+        dtype = next(self._llama_model.parameters()).dtype
+
         z_embed = self.z_to_embed(z_t).unsqueeze(1)                  # (B, 1, d)
         c_embeds = self._embed(input_ids)                            # (B, seq, d)
-        gen_embeds = torch.cat([z_embed, c_embeds], dim=1)           # (B, 1+seq, d)
+        gen_embeds = torch.cat([z_embed, c_embeds], dim=1).to(dtype) # (B, 1+seq, d)
 
         z_mask = attention_mask.new_ones(B, 1)
         gen_mask = torch.cat([z_mask, attention_mask], dim=1)        # (B, 1+seq)
