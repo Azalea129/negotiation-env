@@ -74,9 +74,17 @@ class LASHModel(nn.Module):
 
     # ── Internal helpers ────────────────────────────────────────────────
 
+    @property
+    def _llama_model(self) -> nn.Module:
+        """Return the inner LlamaModel (has embed_tokens), unwrapping PEFT layers."""
+        m = self.base
+        while not hasattr(m, 'embed_tokens'):
+            m = m.model
+        return m
+
     def _embed(self, input_ids: Tensor) -> Tensor:
         """Token id → embedding via base LLM's embedding table."""
-        return self.base.model.embed_tokens(input_ids)
+        return self._llama_model.embed_tokens(input_ids)
 
     def _backbone_hidden(
         self,
@@ -84,7 +92,7 @@ class LASHModel(nn.Module):
         attention_mask: Tensor,
     ) -> Tensor:
         """Run Llama transformer (no LM head), return last hidden states."""
-        out = self.base.model(
+        out = self._llama_model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
         )
