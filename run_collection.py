@@ -20,9 +20,17 @@ Usage:
 
 import argparse
 import sys
+import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from lash import A2ANegotiationEnv, LASHConfig, collection_stats, save_episode
+
+_print_lock = threading.Lock()
+
+def _safe_print(*args, **kwargs):
+    with _print_lock:
+        print(*args, **kwargs)
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,6 +45,8 @@ def parse_args() -> argparse.Namespace:
                    help="0=cooperative reward, 1=selfish reward")
     p.add_argument("--output-dir", default="data", help="Directory for output JSONL files")
     p.add_argument("--seed", type=int, default=None, help="Base random seed (incremented per episode)")
+    p.add_argument("--parallel", type=int, default=8,
+                   help="Number of episodes to run concurrently (default: 8)")
     return p.parse_args()
 
 
@@ -53,30 +63,38 @@ def main() -> None:
     )
     env = A2ANegotiationEnv(config)
 
-    print(f"Model : {config.model}")
+    print(f"Model    : {config.model}")
     if config.api_base:
-        print(f"API   : {config.api_base}")
-    print(f"Output: {args.output_dir}/")
-    print(f"Running {args.n} episodes...\n")
+        print(f"API      : {config.api_base}")
+    print(f"Output   : {args.output_dir}/")
+    print(f"Episodes : {args.n}  |  parallel={args.parallel}\n")
 
-    for i in range(args.n):
+    def _run_one(i: int):
         seed = (args.seed + i) if args.seed is not None else None
-        try:
-            ep = env.run(seed=seed)
-            n_pairs = save_episode(ep, args.output_dir)
+        ep = env.run(seed=seed)
+        n_pairs = save_episode(ep, args.output_dir)
+        return i, ep, n_pairs
 
-            status = "DEAL" if ep.deal_reached else ep.termination.upper()
-            price_str = f"${ep.deal_price:.0f}" if ep.deal_price else "—"
-            print(
-                f"[{i+1:>4}/{args.n}] {ep.episode_id}  {status:<12} "
-                f"price={price_str:<8} welfare={ep.total_welfare:>7.1f}  pairs={n_pairs}"
-            )
-        except KeyboardInterrupt:
-            print("\nInterrupted by user.")
-            break
-        except Exception:
-            print(f"[{i+1:>4}/{args.n}] ERROR — skipping episode")
-            traceback.print_exc()
+    completed = 0
+    try:
+        with ThreadPoolExecutor(max_workers=args.parallel) as executor:
+            futures = {executor.submit(_run_one, i): i for i in range(args.n)}
+            for future in as_completed(futures):
+                try:
+                    i, ep, n_pairs = future.result()
+                    completed += 1
+                    status = "DEAL" if ep.deal_reached else ep.termination.upper()
+                    price_str = f"${ep.deal_price:.0f}" if ep.deal_price else "-"
+                    _safe_print(
+                        f"[{completed:>4}/{args.n}] {ep.episode_id}  {status:<12} "
+                        f"price={price_str:<8} welfare={ep.total_welfare:>7.1f}  pairs={n_pairs}"
+                    )
+                except Exception:
+                    completed += 1
+                    _safe_print(f"[{completed:>4}/{args.n}] ERROR — skipping episode")
+                    traceback.print_exc()
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.")
 
     stats = collection_stats(args.output_dir)
     print(f"\n── Collection complete ─────────────────────────────")

@@ -25,10 +25,14 @@ Two output formats:
 """
 
 import json
+import threading
 from pathlib import Path
 from typing import Optional
 
 from .types import EpisodeData, TurnData
+
+# Protects concurrent file writes when running parallel episode collection
+_write_lock = threading.Lock()
 
 
 # ── Episode serialization ──────────────────────────────────────────────────
@@ -99,28 +103,30 @@ def is_valid_training_pair(pair: dict) -> bool:
 # ── I/O ────────────────────────────────────────────────────────────────────
 
 def append_episode(ep: EpisodeData, output_dir: str) -> None:
-    """Append one episode to episodes.jsonl."""
+    """Append one episode to episodes.jsonl (thread-safe)."""
     path = Path(output_dir) / "episodes.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(_episode_to_dict(ep), ensure_ascii=False) + "\n")
+    with _write_lock:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(_episode_to_dict(ep), ensure_ascii=False) + "\n")
 
 
 def append_training_pairs(ep: EpisodeData, output_dir: str) -> int:
     """
     Append valid (context, belief_gt, intention_gt, message) tuples to training_pairs.jsonl.
-    Returns number of pairs written.
+    Returns number of pairs written (thread-safe).
     """
     path = Path(output_dir) / "training_pairs.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
-    written = 0
-    with path.open("a", encoding="utf-8") as f:
-        for t in ep.turns:
-            pair = _turn_to_training_pair(t, ep)
-            if is_valid_training_pair(pair):
-                f.write(json.dumps(pair, ensure_ascii=False) + "\n")
-                written += 1
-    return written
+    lines = []
+    for t in ep.turns:
+        pair = _turn_to_training_pair(t, ep)
+        if is_valid_training_pair(pair):
+            lines.append(json.dumps(pair, ensure_ascii=False) + "\n")
+    with _write_lock:
+        with path.open("a", encoding="utf-8") as f:
+            f.writelines(lines)
+    return len(lines)
 
 
 def save_episode(ep: EpisodeData, output_dir: str) -> int:

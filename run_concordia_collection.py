@@ -47,6 +47,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--output-dir", default="data")
     p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--parallel", type=int, default=8,
+                   help="Concurrent episodes per game type (default: 8)")
     return p.parse_args()
 
 
@@ -75,6 +77,7 @@ def main() -> None:
         output_dir=args.output_dir,
         games=games,
         seed=args.seed,
+        parallel=args.parallel,
         verbose=True,
     )
 

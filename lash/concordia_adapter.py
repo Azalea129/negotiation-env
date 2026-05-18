@@ -1024,45 +1024,65 @@ def run_multitask_collection(
     output_dir: str,
     games: Optional[list[str]] = None,
     seed: Optional[int] = None,
+    parallel: int = 8,
     verbose: bool = True,
 ) -> dict[str, int]:
     """
     Run N episodes for each game type and save to output_dir.
+    Episodes within each game type run concurrently (parallel workers).
 
     Returns dict of {game_name: training_pairs_collected}.
     """
+    import threading
     import traceback
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    _print_lock = threading.Lock()
+
+    def _safe_print(*args, **kwargs):
+        with _print_lock:
+            print(*args, **kwargs)
 
     games = games or list(GAME_REGISTRY.keys())
     stats: dict[str, int] = {}
 
     for game_name in games:
         game_cls = GAME_REGISTRY[game_name]
-        game = game_cls(config)
         pairs_total = 0
+        completed = 0
 
         if verbose:
-            print(f"\n── {game_name} ({n_episodes_per_game} episodes) ──")
+            print(f"\n── {game_name} ({n_episodes_per_game} episodes, parallel={parallel}) ──")
 
-        for i in range(n_episodes_per_game):
+        def _run_one(i: int, game_cls=game_cls) -> tuple[int, "EpisodeData", int]:
+            game = game_cls(config)   # fresh instance per thread
             ep_seed = (seed + i) if seed is not None else None
-            try:
-                ep = game.run(seed=ep_seed)
-                append_episode(ep, output_dir)
-                n = append_training_pairs(ep, output_dir)
-                pairs_total += n
-                if verbose:
-                    print(
-                        f"  [{i+1:>3}/{n_episodes_per_game}] {ep.episode_id}"
-                        f"  welfare={ep.total_welfare:>7.1f}  pairs={n}"
-                    )
-            except KeyboardInterrupt:
-                print("\nInterrupted.")
-                stats[game_name] = pairs_total
-                return stats
-            except Exception:
-                print(f"  [{i+1:>3}/{n_episodes_per_game}] ERROR — skipping")
-                traceback.print_exc()
+            ep = game.run(seed=ep_seed)
+            append_episode(ep, output_dir)
+            n = append_training_pairs(ep, output_dir)
+            return i, ep, n
+
+        try:
+            with ThreadPoolExecutor(max_workers=parallel) as executor:
+                futures = {executor.submit(_run_one, i): i
+                           for i in range(n_episodes_per_game)}
+                for future in as_completed(futures):
+                    completed += 1
+                    try:
+                        i, ep, n = future.result()
+                        pairs_total += n
+                        if verbose:
+                            _safe_print(
+                                f"  [{completed:>3}/{n_episodes_per_game}] {ep.episode_id}"
+                                f"  welfare={ep.total_welfare:>7.1f}  pairs={n}"
+                            )
+                    except Exception:
+                        _safe_print(f"  [{completed:>3}/{n_episodes_per_game}] ERROR — skipping")
+                        traceback.print_exc()
+        except KeyboardInterrupt:
+            print("\nInterrupted.")
+            stats[game_name] = pairs_total
+            return stats
 
         stats[game_name] = pairs_total
 
