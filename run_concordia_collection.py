@@ -24,6 +24,9 @@ Available games:
   resource_allocation  N-player sealed-bid multi-item auction
   haggling             2-player bilateral price negotiation (Stage 1 variant)
   stag_hunt            2-player coordination game (held-out evaluation candidate)
+  ultimatum            2-player Ultimatum Game (fairness norm reasoning)
+  liars_dice           2-player Liar's Dice (deception detection)
+  mafia                5-player Mafia (hidden role inference, multi-party ToM)
 """
 
 import argparse

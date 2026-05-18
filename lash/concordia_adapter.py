@@ -921,6 +921,593 @@ def _sh_payoff(a0: str, a1: str) -> tuple[float, float]:
     return 2.0, 0.0   # a0==HARE, a1==STAG
 
 
+# ── Ultimatum Game ─────────────────────────────────────────────────────────
+
+_UG_RULES = """\
+- There is a pot of {pot} points to split between two players.
+- Each round one player is the Proposer and one is the Responder.
+- Proposer offers a split: how many points the Responder receives (rest goes to Proposer).
+- Responder accepts or rejects:
+    ACCEPT → both receive the proposed amounts.
+    REJECT → both receive 0 for this round.
+- Roles alternate each round. Game lasts {n_rounds} rounds.
+- Maximise your cumulative points."""
+
+_UG_PROPOSER_FORMAT = """\
+ACTION FORMAT (you are Proposer this round):
+  PROPOSE: X
+where X is the integer number of points you offer to the Responder (0 ≤ X ≤ {pot})."""
+
+_UG_RESPONDER_FORMAT = """\
+ACTION FORMAT (you are Responder this round):
+  ACCEPT
+  REJECT"""
+
+
+def _parse_ug_offer(text: str) -> Optional[int]:
+    m = re.search(r"PROPOSE\s*:\s*(\d+)", text, re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+def _parse_ug_response(text: str) -> str:
+    upper = text.upper()
+    if "ACCEPT" in upper:
+        return "ACCEPT"
+    return "REJECT"
+
+
+class UltimatumGame(BaseGame):
+    """
+    2-player Ultimatum Game with alternating Proposer/Responder roles.
+
+    Key ToM task: fairness norm inference — does the opponent have a high
+    minimum-acceptable-offer threshold?  Does the Proposer model that threshold?
+    """
+
+    def __init__(self, config: LASHConfig, n_rounds: int = 6, pot: int = 100):
+        super().__init__(config)
+        self.n_rounds = n_rounds
+        self.pot = pot
+
+    def run(self, seed: Optional[int] = None) -> EpisodeData:
+        import random
+        rng = random.Random(seed)
+
+        names = ["Alice", "Bob"]
+        turns: list[TurnData] = []
+        scores = [0.0, 0.0]
+        turn_idx = 0
+
+        agents = [
+            StrategicGameAgent(
+                name=names[i],
+                system_prompt=_build_system_prompt(self.config,
+                    agent_name=names[i],
+                    game_name="Ultimatum Game",
+                    game_rules=_UG_RULES.format(pot=self.pot, n_rounds=self.n_rounds),
+                    private_info="No hidden private information.",
+                    opponent_description=names[1 - i],
+                    action_format="(see per-round instructions)",
+                ),
+                config=self.config,
+                agent_idx=i,
+                natural_language_message=self.config.natural_language_message,
+            )
+            for i in range(2)
+        ]
+
+        for rnd in range(self.n_rounds):
+            prop_idx = rnd % 2
+            resp_idx = 1 - prop_idx
+
+            # --- Proposer turn ---
+            prop_obs = (
+                f"=== ULTIMATUM — Round {rnd + 1}/{self.n_rounds} ===\n"
+                f"Score: {names[0]}={scores[0]:.0f}, {names[1]}={scores[1]:.0f}\n"
+                f"You are the Proposer this round. Pot = {self.pot}.\n"
+                + _UG_PROPOSER_FORMAT.format(pot=self.pot)
+            )
+            prop_resp = agents[prop_idx].act(prop_obs)
+            offer = _parse_ug_offer(prop_resp["raw_cot"])
+            if offer is None:
+                offer = rng.randint(30, 50)  # fallback if parse fails
+            offer = max(0, min(self.pot, offer))
+
+            turns.append(TurnData(
+                turn=turn_idx,
+                round=rnd,
+                role=names[prop_idx],
+                context=prop_resp["context"],
+                raw_cot=prop_resp["raw_cot"],
+                belief_text=prop_resp["belief_text"],
+                intention_text=prop_resp["intention_text"],
+                visible_message=prop_resp["visible_message"],
+                action="propose",
+                price=float(offer),
+            ))
+            turn_idx += 1
+
+            # --- Responder turn ---
+            resp_obs = (
+                f"=== ULTIMATUM — Round {rnd + 1}/{self.n_rounds} ===\n"
+                f"Score: {names[0]}={scores[0]:.0f}, {names[1]}={scores[1]:.0f}\n"
+                f"You are the Responder. {names[prop_idx]} offers you {offer} points "
+                f"(keeps {self.pot - offer}).\n"
+                + _UG_RESPONDER_FORMAT
+            )
+            # Share proposer's visible message as context for responder
+            agents[resp_idx].context_lines.append(
+                f"[{names[prop_idx]}]: {prop_resp['visible_message']}"
+            )
+            resp_resp = agents[resp_idx].act(resp_obs)
+            decision = _parse_ug_response(resp_resp["raw_cot"])
+
+            turns.append(TurnData(
+                turn=turn_idx,
+                round=rnd,
+                role=names[resp_idx],
+                context=resp_resp["context"],
+                raw_cot=resp_resp["raw_cot"],
+                belief_text=resp_resp["belief_text"],
+                intention_text=resp_resp["intention_text"],
+                visible_message=resp_resp["visible_message"],
+                action=decision.lower(),
+                price=None,
+            ))
+            turn_idx += 1
+
+            # --- Update scores ---
+            if decision == "ACCEPT":
+                scores[prop_idx] += self.pot - offer
+                scores[resp_idx] += offer
+            # Share responder's visible message back
+            agents[prop_idx].context_lines.append(
+                f"[{names[resp_idx]}]: {resp_resp['visible_message']}"
+            )
+
+        return EpisodeData(
+            episode_id=self._new_episode_id(),
+            buyer_type=None,
+            seller_type=None,
+            deal_reached=True,
+            deal_price=None,
+            deal_round=self.n_rounds - 1,
+            termination="complete",
+            buyer_surplus=scores[0],
+            seller_surplus=scores[1],
+            total_welfare=sum(scores),
+            buyer_reward=scores[0],
+            seller_reward=scores[1],
+            turns=turns,
+        )
+
+
+# ── Liar's Dice Game ────────────────────────────────────────────────────────
+
+_LD_RULES = """\
+- Each player starts each sequence with {n_dice} dice rolled privately.
+- Players take turns either raising the bid or challenging.
+- A bid is "Q F" meaning "there are at least Q dice showing face F across ALL players' dice."
+- A raise must increase Q, or keep Q and increase F (face 1–6).
+- Call LIAR to challenge the previous bid:
+    If total count of face F < Q  → challenger wins this sequence.
+    If total count of face F ≥ Q  → bidder wins this sequence.
+- Winner scores 1 point; loser re-rolls and starts next bid.
+- Game lasts {n_sequences} sequences. Maximise your score."""
+
+_LD_ACTION_FORMAT = """\
+ACTION FORMAT:
+  BID: Q F     (e.g. "BID: 3 4" means "at least 3 fours")
+  LIAR         (challenge the current bid)
+First player each sequence MUST BID (cannot call LIAR)."""
+
+
+def _parse_ld_bid(text: str) -> Optional[tuple[int, int]]:
+    m = re.search(r"BID\s*:\s*(\d+)\s+(\d+)", text, re.IGNORECASE)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None
+
+
+def _is_valid_ld_bid(new: tuple[int, int], prev: Optional[tuple[int, int]]) -> bool:
+    if prev is None:
+        return True
+    q_new, f_new = new
+    q_prev, f_prev = prev
+    return (q_new > q_prev) or (q_new == q_prev and f_new > f_prev)
+
+
+class LiarsDiceGame(BaseGame):
+    """
+    2-player Liar's Dice.
+
+    Key ToM task: detecting deceptive bids — does the opponent overbid frequently?
+    Agents must maintain beliefs about hidden dice and opponent bluffing style.
+    """
+
+    def __init__(self, config: LASHConfig, n_dice: int = 5, n_sequences: int = 5):
+        super().__init__(config)
+        self.n_dice = n_dice
+        self.n_sequences = n_sequences
+
+    def _roll(self, rng) -> list[int]:
+        return [rng.randint(1, 6) for _ in range(self.n_dice)]
+
+    def run(self, seed: Optional[int] = None) -> EpisodeData:
+        import random
+        rng = random.Random(seed)
+
+        names = ["Alice", "Bob"]
+        turns: list[TurnData] = []
+        scores = [0, 0]
+        turn_idx = 0
+
+        agents = [
+            StrategicGameAgent(
+                name=names[i],
+                system_prompt=_build_system_prompt(self.config,
+                    agent_name=names[i],
+                    game_name="Liar's Dice",
+                    game_rules=_LD_RULES.format(n_dice=self.n_dice, n_sequences=self.n_sequences),
+                    private_info="(assigned each sequence — see round observations)",
+                    opponent_description=names[1 - i],
+                    action_format=_LD_ACTION_FORMAT,
+                ),
+                config=self.config,
+                agent_idx=i,
+                natural_language_message=self.config.natural_language_message,
+            )
+            for i in range(2)
+        ]
+
+        for seq in range(self.n_sequences):
+            dice = [self._roll(rng), self._roll(rng)]
+            current_bid: Optional[tuple[int, int]] = None
+            bidder_idx = seq % 2        # who made the most recent bid
+            actor_idx = seq % 2         # whose turn it is
+            max_bids = self.n_dice * 2 + 4
+            seq_done = False
+
+            for bid_step in range(max_bids):
+                is_first = bid_step == 0
+                my_dice_str = " ".join(str(d) for d in dice[actor_idx])
+                obs_lines = [
+                    f"=== LIAR'S DICE — Sequence {seq + 1}/{self.n_sequences}, Turn {bid_step + 1} ===",
+                    f"Scores: {names[0]}={scores[0]}, {names[1]}={scores[1]}",
+                    f"Your dice (private): [{my_dice_str}]",
+                ]
+                if current_bid:
+                    obs_lines.append(
+                        f"Current bid by {names[bidder_idx]}: {current_bid[0]} × face {current_bid[1]}"
+                    )
+                    obs_lines.append("You may BID higher or call LIAR.")
+                else:
+                    obs_lines.append("You must place the opening BID.")
+                obs = "\n".join(obs_lines)
+
+                resp = agents[actor_idx].act(obs)
+                action_text = resp["raw_cot"]
+
+                if not is_first and "LIAR" in action_text.upper() and current_bid is not None:
+                    # Resolve challenge
+                    q, f = current_bid
+                    actual = sum(1 for d_set in dice for d in d_set if d == f)
+                    challenger_idx = actor_idx
+                    if actual < q:
+                        winner_idx, loser_idx = challenger_idx, bidder_idx
+                        result_str = f"LIAR called: actual {actual} < bid {q}. Challenger wins."
+                    else:
+                        winner_idx, loser_idx = bidder_idx, challenger_idx
+                        result_str = f"LIAR called: actual {actual} ≥ bid {q}. Bidder wins."
+
+                    scores[winner_idx] += 1
+                    turns.append(TurnData(
+                        turn=turn_idx, round=seq, role=names[actor_idx],
+                        context=resp["context"], raw_cot=resp["raw_cot"],
+                        belief_text=resp["belief_text"], intention_text=resp["intention_text"],
+                        visible_message=resp["visible_message"],
+                        action="liar", price=None,
+                    ))
+                    turn_idx += 1
+                    # Broadcast resolution to both agents
+                    for ag in agents:
+                        ag.context_lines.append(result_str)
+                    seq_done = True
+                    break
+                else:
+                    new_bid = _parse_ld_bid(action_text)
+                    if new_bid is None or not _is_valid_ld_bid(new_bid, current_bid):
+                        # Invalid — force a minimal valid bid
+                        if current_bid is None:
+                            new_bid = (1, rng.randint(1, 6))
+                        else:
+                            q_p, f_p = current_bid
+                            new_bid = (q_p + 1, f_p) if f_p == 6 else (q_p, f_p + 1)
+
+                    turns.append(TurnData(
+                        turn=turn_idx, round=seq, role=names[actor_idx],
+                        context=resp["context"], raw_cot=resp["raw_cot"],
+                        belief_text=resp["belief_text"], intention_text=resp["intention_text"],
+                        visible_message=resp["visible_message"],
+                        action=f"bid:{new_bid[0]}:{new_bid[1]}", price=float(new_bid[0]),
+                    ))
+                    turn_idx += 1
+                    # Share bid as context for opponent
+                    agents[1 - actor_idx].context_lines.append(
+                        f"[{names[actor_idx]}] bids {new_bid[0]} × face {new_bid[1]} | says: {resp['visible_message']}"
+                    )
+                    current_bid = new_bid
+                    bidder_idx = actor_idx
+                    actor_idx = 1 - actor_idx
+
+            if not seq_done:
+                # Max bids reached — bidder wins by default
+                scores[bidder_idx] += 1
+
+        return EpisodeData(
+            episode_id=self._new_episode_id(),
+            buyer_type=None,
+            seller_type=None,
+            deal_reached=True,
+            deal_price=None,
+            deal_round=self.n_sequences - 1,
+            termination="complete",
+            buyer_surplus=float(scores[0]),
+            seller_surplus=float(scores[1]),
+            total_welfare=float(sum(scores)),
+            buyer_reward=float(scores[0]),
+            seller_reward=float(scores[1]),
+            turns=turns,
+        )
+
+
+# ── Mafia Game ──────────────────────────────────────────────────────────────
+
+_MAFIA_DAY_FORMAT = """\
+DISCUSSION TURN FORMAT:
+  Say what you want in your <message>.
+
+VOTE FORMAT (at end of day discussion):
+  VOTE: <player_name>"""
+
+_MAFIA_NIGHT_FORMAT = """\
+NIGHT ACTION FORMAT (Mafia only):
+  KILL: <player_name>"""
+
+_MAFIA_TOWN_RULES = """\
+- There are {n_players} players: {n_mafia} Mafia and {n_town} Town.
+- You are Town. You do NOT know who is Mafia.
+- During the day, all surviving players discuss and then vote to eliminate one player.
+  The player with the most votes is eliminated.
+- At night, the Mafia secretly choose one Town player to eliminate.
+- Town wins if all Mafia are eliminated.
+- Mafia wins if they equal or outnumber Town.
+- Reason carefully about who seems deceptive or inconsistent."""
+
+_MAFIA_MAFIA_RULES = """\
+- There are {n_players} players: {n_mafia} Mafia and {n_town} Town.
+- You are Mafia. Your partner(s): {partners}.
+- During the day, all players discuss and vote to eliminate one player.
+  Stay hidden — blend in with Town.
+- At night, Mafia collectively choose one Town player to eliminate.
+- Mafia wins if you equal or outnumber Town.
+- Town wins if all Mafia are eliminated."""
+
+
+def _parse_mafia_vote(text: str, valid_names: list[str]) -> Optional[str]:
+    m = re.search(r"VOTE\s*:\s*(\w+)", text, re.IGNORECASE)
+    if m:
+        name = m.group(1).strip()
+        for v in valid_names:
+            if v.lower() == name.lower():
+                return v
+    return None
+
+
+def _parse_mafia_kill(text: str, valid_names: list[str]) -> Optional[str]:
+    m = re.search(r"KILL\s*:\s*(\w+)", text, re.IGNORECASE)
+    if m:
+        name = m.group(1).strip()
+        for v in valid_names:
+            if v.lower() == name.lower():
+                return v
+    return None
+
+
+class MafiaGame(BaseGame):
+    """
+    5-player Mafia: 2 Mafia + 3 Town, day discussion/vote + night kill.
+
+    Key ToM task: hidden role inference — who is lying about their identity?
+    Requires multi-party belief tracking; Mafia agents must maintain cover.
+    """
+
+    ALL_NAMES = ["Alice", "Bob", "Carol", "Dave", "Eve"]
+
+    def __init__(self, config: LASHConfig, n_players: int = 5, n_mafia: int = 2):
+        super().__init__(config)
+        self.n_players = n_players
+        self.n_mafia = n_mafia
+
+    def run(self, seed: Optional[int] = None) -> EpisodeData:
+        import random
+        rng = random.Random(seed)
+
+        names = self.ALL_NAMES[:self.n_players]
+        roles = ["mafia"] * self.n_mafia + ["town"] * (self.n_players - self.n_mafia)
+        rng.shuffle(roles)
+        role_map = dict(zip(names, roles))
+
+        mafia_names = [n for n, r in role_map.items() if r == "mafia"]
+        town_names  = [n for n, r in role_map.items() if r == "town"]
+
+        turns: list[TurnData] = []
+        turn_idx = 0
+
+        def make_agent(name: str) -> StrategicGameAgent:
+            role = role_map[name]
+            if role == "mafia":
+                partners = [m for m in mafia_names if m != name]
+                rules = _MAFIA_MAFIA_RULES.format(
+                    n_players=self.n_players,
+                    n_mafia=self.n_mafia,
+                    n_town=self.n_players - self.n_mafia,
+                    partners=", ".join(partners),
+                )
+                private = f"Your role: MAFIA. Partners: {', '.join(partners)}."
+            else:
+                rules = _MAFIA_TOWN_RULES.format(
+                    n_players=self.n_players,
+                    n_mafia=self.n_mafia,
+                    n_town=self.n_players - self.n_mafia,
+                )
+                private = "Your role: TOWN. You have no special information."
+
+            return StrategicGameAgent(
+                name=name,
+                system_prompt=_build_system_prompt(self.config,
+                    agent_name=name,
+                    game_name="Mafia",
+                    game_rules=rules,
+                    private_info=private,
+                    opponent_description="the other players",
+                    action_format=_MAFIA_DAY_FORMAT,
+                ),
+                config=self.config,
+                agent_idx=names.index(name),
+                natural_language_message=self.config.natural_language_message,
+            )
+
+        agents = {name: make_agent(name) for name in names}
+        alive = list(names)
+        day = 0
+        winner = None
+
+        while True:
+            # ── Day phase ────────────────────────────────────────────────────
+            day += 1
+            day_header = (
+                f"=== MAFIA — Day {day} ===\n"
+                f"Alive: {', '.join(alive)}\n"
+            )
+
+            # Discussion: each alive player speaks once
+            for speaker in list(alive):
+                obs = day_header + f"It's your turn to speak. Share your suspicions."
+                resp = agents[speaker].act(obs)
+                turns.append(TurnData(
+                    turn=turn_idx, round=day * 10,
+                    role=speaker,
+                    context=resp["context"], raw_cot=resp["raw_cot"],
+                    belief_text=resp["belief_text"], intention_text=resp["intention_text"],
+                    visible_message=resp["visible_message"],
+                    action="speak", price=None,
+                ))
+                turn_idx += 1
+                # Broadcast message to everyone else
+                for other in alive:
+                    if other != speaker:
+                        agents[other].context_lines.append(
+                            f"[Day {day}] {speaker}: {resp['visible_message']}"
+                        )
+
+            # Vote: each alive player votes
+            vote_counts: dict[str, int] = {n: 0 for n in alive}
+            for voter in list(alive):
+                obs = day_header + "Time to vote. VOTE: <player_name>"
+                resp = agents[voter].act(obs)
+                target = _parse_mafia_vote(resp["raw_cot"], [n for n in alive if n != voter])
+                if target is None:
+                    target = rng.choice([n for n in alive if n != voter])
+                vote_counts[target] += 1
+                turns.append(TurnData(
+                    turn=turn_idx, round=day * 10 + 1,
+                    role=voter,
+                    context=resp["context"], raw_cot=resp["raw_cot"],
+                    belief_text=resp["belief_text"], intention_text=resp["intention_text"],
+                    visible_message=resp["visible_message"],
+                    action=f"vote:{target}", price=None,
+                ))
+                turn_idx += 1
+
+            # Eliminate most-voted player (random tiebreak)
+            max_votes = max(vote_counts.values())
+            candidates = [n for n, v in vote_counts.items() if v == max_votes]
+            eliminated = rng.choice(candidates)
+            alive.remove(eliminated)
+            elim_msg = f"[Day {day}] {eliminated} ({role_map[eliminated]}) was eliminated by vote."
+            for ag in agents.values():
+                ag.context_lines.append(elim_msg)
+
+            # Check win after day
+            surviving_mafia = [n for n in alive if role_map[n] == "mafia"]
+            surviving_town  = [n for n in alive if role_map[n] == "town"]
+            if not surviving_mafia:
+                winner = "town"
+                break
+            if len(surviving_mafia) >= len(surviving_town):
+                winner = "mafia"
+                break
+
+            # ── Night phase ──────────────────────────────────────────────────
+            # Mafia collectively choose a kill (first mafia agent decides, others echo)
+            night_obs = (
+                f"=== MAFIA — Night {day} ===\n"
+                f"Alive Town: {', '.join(surviving_town)}\n"
+                "Choose a Town player to eliminate. KILL: <player_name>"
+            )
+            kill_target = None
+            for mafia_name in surviving_mafia:
+                agents[mafia_name].config = self.config  # ensure config access
+                resp = agents[mafia_name].act(night_obs)
+                if kill_target is None:
+                    kill_target = _parse_mafia_kill(resp["raw_cot"], surviving_town)
+                    if kill_target is None:
+                        kill_target = rng.choice(surviving_town)
+                turns.append(TurnData(
+                    turn=turn_idx, round=day * 10 + 2,
+                    role=mafia_name,
+                    context=resp["context"], raw_cot=resp["raw_cot"],
+                    belief_text=resp["belief_text"], intention_text=resp["intention_text"],
+                    visible_message=resp["visible_message"],
+                    action=f"kill:{kill_target}", price=None,
+                ))
+                turn_idx += 1
+
+            alive.remove(kill_target)
+            kill_msg = f"[Night {day}] {kill_target} (town) was eliminated by Mafia."
+            for ag in agents.values():
+                ag.context_lines.append(kill_msg)
+
+            surviving_mafia = [n for n in alive if role_map[n] == "mafia"]
+            surviving_town  = [n for n in alive if role_map[n] == "town"]
+            if not surviving_mafia:
+                winner = "town"
+                break
+            if len(surviving_mafia) >= len(surviving_town):
+                winner = "mafia"
+                break
+
+        town_reward  = 1.0 if winner == "town"  else 0.0
+        mafia_reward = 1.0 if winner == "mafia" else 0.0
+
+        return EpisodeData(
+            episode_id=self._new_episode_id(),
+            buyer_type=None,
+            seller_type=None,
+            deal_reached=True,
+            deal_price=None,
+            deal_round=day,
+            termination=f"{winner}_wins",
+            buyer_surplus=town_reward,
+            seller_surplus=mafia_reward,
+            total_welfare=1.0,
+            buyer_reward=town_reward,
+            seller_reward=mafia_reward,
+            turns=turns,
+        )
+
+
 # ── Concordia integration (optional) ───────────────────────────────────────
 
 try:
@@ -1015,6 +1602,9 @@ GAME_REGISTRY: dict[str, type[BaseGame]] = {
     "resource_allocation": ResourceAllocationGame,
     "haggling": HagglingGame,
     "stag_hunt": StagHuntGame,
+    "ultimatum": UltimatumGame,
+    "liars_dice": LiarsDiceGame,
+    "mafia": MafiaGame,
 }
 
 
