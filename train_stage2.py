@@ -106,7 +106,7 @@ def load_from_stage1(
     from peft import PeftModel
 
     ckpt = Path(stage1_dir)
-    train_state = torch.load(ckpt / "train_state.pt", map_location="cpu")
+    train_state = torch.load(ckpt / "train_state.pt", map_location="cpu", weights_only=False)
     model_cfg: LASHModelConfig = train_state["model_cfg"]
     model_cfg.base_model_name = base_model_name
 
@@ -132,7 +132,7 @@ def load_from_stage1(
     base = PeftModel.from_pretrained(base, str(ckpt / "lora_adapter"))
 
     model = LASHModel(base, model_cfg)
-    lash_state = torch.load(ckpt / "lash_modules.pt", map_location=device)
+    lash_state = torch.load(ckpt / "lash_modules.pt", map_location=device, weights_only=False)
     # strict=False: lash_modules.pt has no "base.*" keys, rest of model is already loaded
     missing, unexpected = model.load_state_dict(lash_state, strict=False)
     assert not unexpected, f"Unexpected keys in lash_modules.pt: {unexpected}"
