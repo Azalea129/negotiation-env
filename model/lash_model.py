@@ -274,7 +274,7 @@ class LASHModel(nn.Module):
         _, weights = self.hypothesis_attn(c_pooled, h_b, h_i)
         return weights.squeeze(1)    # (B, 2k)
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def generate(
         self,
         input_ids: Tensor,
