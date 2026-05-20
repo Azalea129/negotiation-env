@@ -23,7 +23,13 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from .agents import _BUYER_SYSTEM, _SELLER_SYSTEM, extract_action, strip_cot
+from .agents import (
+    _BUYER_SYSTEM, _SELLER_SYSTEM,
+    _MSG_SECTION_BUYER, _MSG_SECTION_SELLER,
+    _ACTION_TAG_NOTE_WITH_MSG, _ACTION_TAG_NOTE_NO_MSG,
+    _VISIBILITY_WITH_MSG, _VISIBILITY_NO_MSG,
+    extract_action, strip_cot,
+)
 from .config import LASHConfig
 from .types import BuyerType, SellerType
 
@@ -86,17 +92,24 @@ class GRPORolloutEnv:
         buyer_type: BuyerType,
         seller_type: SellerType,
     ) -> RolloutEpisode:
+        use_msg = self.cfg.natural_language_message
         buyer_sys = _BUYER_SYSTEM.format(
             item_description=self.cfg.item_description,
             reservation_price=buyer_type.reservation_price,
             delta=buyer_type.delta,
             max_rounds=self.cfg.max_rounds,
+            message_section=_MSG_SECTION_BUYER if use_msg else "",
+            action_tag_note=_ACTION_TAG_NOTE_WITH_MSG if use_msg else _ACTION_TAG_NOTE_NO_MSG,
+            visibility_note=_VISIBILITY_WITH_MSG if use_msg else _VISIBILITY_NO_MSG,
         )
         seller_sys = _SELLER_SYSTEM.format(
             item_description=self.cfg.item_description,
             reservation_price=seller_type.reservation_price,
             delta=seller_type.delta,
             max_rounds=self.cfg.max_rounds,
+            message_section=_MSG_SECTION_SELLER if use_msg else "",
+            action_tag_note=_ACTION_TAG_NOTE_WITH_MSG if use_msg else _ACTION_TAG_NOTE_NO_MSG,
+            visibility_note=_VISIBILITY_WITH_MSG if use_msg else _VISIBILITY_NO_MSG,
         )
 
         context_lines: list[str] = []
