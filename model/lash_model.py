@@ -293,10 +293,11 @@ class LASHModel(nn.Module):
         if oracle_ratio > 0.0 and oracle_z is not None:
             z_t = oracle_ratio * oracle_z + (1.0 - oracle_ratio) * z_t
 
+        dtype = next(self._llama_model.parameters()).dtype
         B = input_ids.size(0)
         z_embed = self.z_to_embed(z_t).unsqueeze(1)                  # (B, 1, d)
         c_embeds = self._embed(input_ids)
-        gen_embeds = torch.cat([z_embed, c_embeds], dim=1)
+        gen_embeds = torch.cat([z_embed, c_embeds], dim=1).to(dtype)
         z_mask = attention_mask.new_ones(B, 1)
         gen_mask = torch.cat([z_mask, attention_mask], dim=1)
 
