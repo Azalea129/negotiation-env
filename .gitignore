@@ -3,8 +3,7 @@ __pycache__/
 *.pyc
 *.egg-info/
 
-# collected data (large, not versioned)
-data/
+# collected data — tracked in repo (use git add -f if needed)
 data_smoke/
 data_smoke2/
 
