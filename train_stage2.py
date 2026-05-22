@@ -217,7 +217,7 @@ def assign_advantages(
 def grpo_loss_for_turns(
     turns: list[RolloutTurn],
     model: LASHModel,
-    ref_model: LASHModel,
+    ref_model: Optional[LASHModel],
     lambda_kl: float,
     clip_eps: float,
     device: str,
@@ -228,7 +228,8 @@ def grpo_loss_for_turns(
     L_turn = -min(r·A, clip(r, 1-ε, 1+ε)·A) + λ_kl · (log π_θ − log π_ref)
 
     The gradient flows end-to-end through Pass 1 + Pass 2 of model.
-    ref_model is called under no_grad.
+    ref_model is called under no_grad. If ref_model is None (memory-constrained
+    setups), the KL term is dropped and only the clipped policy gradient is used.
     """
     total = torch.tensor(0.0, device=device)
 
@@ -236,18 +237,21 @@ def grpo_loss_for_turns(
         # Current policy log prob — WITH gradient
         curr_lp = compute_sum_log_prob(model, turn.ctx_ids, turn.ctx_mask, turn.msg_ids, device)
 
-        # Reference policy log prob — stop-gradient
-        with torch.no_grad():
-            ref_lp = compute_sum_log_prob(ref_model, turn.ctx_ids, turn.ctx_mask, turn.msg_ids, device)
-
         # Importance ratio vs rollout policy (π_old)
         ratio = torch.exp(curr_lp - turn.old_log_prob)
         ratio_clipped = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
         adv = torch.tensor(turn.advantage, dtype=torch.float32, device=device)
 
         policy_loss = -torch.min(ratio * adv, ratio_clipped * adv)
-        kl_penalty = curr_lp - ref_lp.detach()
-        total = total + policy_loss + lambda_kl * kl_penalty
+
+        if ref_model is not None and lambda_kl > 0:
+            # Reference policy log prob — stop-gradient
+            with torch.no_grad():
+                ref_lp = compute_sum_log_prob(ref_model, turn.ctx_ids, turn.ctx_mask, turn.msg_ids, device)
+            kl_penalty = curr_lp - ref_lp.detach()
+            total = total + policy_loss + lambda_kl * kl_penalty
+        else:
+            total = total + policy_loss
 
     return total / max(len(turns), 1)
 
@@ -300,13 +304,19 @@ def main() -> None:
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    # Trainable policy + frozen reference
+    # Trainable policy + (optional) frozen reference
     print(f"Loading Stage 1 checkpoint: {args.stage1_dir}")
     model, model_cfg = load_from_stage1(args.stage1_dir, args.model, device, args.load_in_4bit)
-    ref_model, _ = load_from_stage1(args.stage1_dir, args.model, device, args.load_in_4bit)
-    ref_model.eval()
-    for p in ref_model.parameters():
-        p.requires_grad_(False)
+
+    if args.lambda_kl > 0:
+        ref_model, _ = load_from_stage1(args.stage1_dir, args.model, device, args.load_in_4bit)
+        ref_model.eval()
+        for p in ref_model.parameters():
+            p.requires_grad_(False)
+    else:
+        ref_model = None
+        print("lambda_kl=0 → skipping ref_model load (saves ~6GB on small GPUs). "
+              "KL anchor disabled; relying on clipped ratio for stability.")
 
     # Simulation config (used only for prompts + reward; model field unused in rollout)
     sim_cfg = LASHConfig(
