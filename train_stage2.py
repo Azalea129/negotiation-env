@@ -80,6 +80,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-every", type=int, default=5)
     p.add_argument("--load-in-4bit", action="store_true",
                    help="QLoRA: 4-bit NF4 quantization (recommended for T4/16GB VRAM)")
+    p.add_argument("--hf-repo", default=None,
+                   help="If set, upload each saved checkpoint to this HF Hub repo (path_in_repo=stage2/iter_XXXXX). Protects against runtime termination.")
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
@@ -258,6 +260,7 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     iteration: int,
     path: Path,
+    hf_repo: Optional[str] = None,
 ) -> None:
     path.mkdir(parents=True, exist_ok=True)
     lash_state = {k: v for k, v in model.state_dict().items() if not k.startswith("base.")}
@@ -268,6 +271,20 @@ def save_checkpoint(
         path / "train_state.pt",
     )
     print(f"  → checkpoint: {path}")
+
+    if hf_repo:
+        try:
+            from huggingface_hub import HfApi
+            api = HfApi(token=os.environ.get("HF_TOKEN"))
+            api.upload_folder(
+                folder_path=str(path),
+                repo_id=hf_repo,
+                path_in_repo=f"stage2/{path.name}",
+                repo_type="model",
+            )
+            print(f"  → HF upload: {hf_repo}/stage2/{path.name}")
+        except Exception as e:
+            print(f"  ⚠ HF upload failed ({e}) — local checkpoint preserved at {path}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────
@@ -378,9 +395,10 @@ def main() -> None:
 
         if iteration % args.save_every == 0:
             save_checkpoint(model, model_cfg, optimizer, iteration,
-                            output_dir / f"iter_{iteration:05d}")
+                            output_dir / f"iter_{iteration:05d}", hf_repo=args.hf_repo)
 
-    save_checkpoint(model, model_cfg, optimizer, args.n_iterations, output_dir / "final")
+    save_checkpoint(model, model_cfg, optimizer, args.n_iterations,
+                    output_dir / "final", hf_repo=args.hf_repo)
     print(f"\nStage 2 training complete → {output_dir}/final")
 
 
